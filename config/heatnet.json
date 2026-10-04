@@ -56,6 +56,14 @@
       "meter_wrap_mwh": 100000.0,
       "sample_period_s": 30.0,
       "period_hours": 24.0
+    },
+    "alarm": {
+      "window_s": 30.0,
+      "simultaneity_epsilon_s": 1.0,
+      "heartbeat_timeout_s": 60.0,
+      "unclear_policy": "report_worst",
+      "clearance_requires_full_health": true,
+      "trip_on_alarm": true
     }
   }
 }

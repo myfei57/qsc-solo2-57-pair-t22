@@ -54,6 +54,10 @@ class Api:
         add("GET", "/api/events", self._events)
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/alarms", self._alarms)
+        add("GET", "/api/alarm/groups", lambda params, body: self._platform.alarm_report())
+        add("POST", "/api/alarm/raise", self._alarm_raise)
+        add("POST", "/api/alarm/clear", self._alarm_clear)
+        add("POST", "/api/alarm/heartbeat", self._alarm_heartbeat)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
         add("GET", "/api/store", self._store)
@@ -332,6 +336,23 @@ class Api:
 
     def _trip(self, params: dict, body: dict) -> dict:
         return self._platform.trip(str(body.get("reason", "overtemperature")))
+
+    def _alarm_raise(self, params: dict, body: dict) -> dict:
+        return self._platform.raise_alarm(
+            str(body.get("alarm_id", "")),
+            str(body.get("severity", "warning")),
+            str(body.get("channel", "console")),
+            bool(body.get("momentary", False)),
+            str(body.get("message", "")),
+        )
+
+    def _alarm_clear(self, params: dict, body: dict) -> dict:
+        return self._platform.clear_alarm(
+            str(body.get("alarm_id", "")), str(body.get("channel", "console"))
+        )
+
+    def _alarm_heartbeat(self, params: dict, body: dict) -> dict:
+        return self._platform.alarm_heartbeat(str(body.get("channel", "")))
 
     def _reset(self, params: dict, body: dict) -> dict:
         return self._platform.reset_source(str(body.get("operator", "shift-lead")))

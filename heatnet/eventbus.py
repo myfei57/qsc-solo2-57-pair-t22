@@ -60,11 +60,16 @@ class EventBus:
         return unsubscribe
 
     def publish(self, event: Event) -> int:
-        """把事件投递给订阅者，返回被调用的处理器数量。"""
+        """把事件投递给订阅者，返回被调用的处理器数量。
+
+        派发顺序写死为"先全量、后主题"：审计这类全量订阅者先把事件落账，
+        主题订阅者（如告警并组器）随后才反应。这样审计流水里原因永远排在
+        反应之前，不会出现"并组结论比触发它的告警先落盘"的倒挂。
+        """
 
         with self._lock:
-            handlers = list(self._handlers.get(event.topic, ())) + list(
-                self._handlers.get(WILDCARD, ())
+            handlers = list(self._handlers.get(WILDCARD, ())) + list(
+                self._handlers.get(event.topic, ())
             )
             self._history.append(event)
             if len(self._history) > self._history_limit:

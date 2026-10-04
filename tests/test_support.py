@@ -60,7 +60,8 @@ def test_event_bus_publish_and_history():
     unsubscribe = bus.subscribe("source", lambda event: seen.append(event.action))
     bus.subscribe("*", lambda event: seen.append(f"*{event.action}"))
     assert bus.publish(Event.of("source", "source", "adjust", flow_t_h=1200.0)) == 2
-    assert seen == ["adjust", "*adjust"]
+    # 全量订阅者（审计）先于主题订阅者收到事件：先落账、后反应。
+    assert seen == ["*adjust", "adjust"]
     unsubscribe()
     bus.publish(Event.of("source", "source", "trip"))
     assert seen[-1] == "*trip"

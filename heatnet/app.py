@@ -11,6 +11,8 @@ from __future__ import annotations
 import dataclasses
 import threading
 
+from .alarm import AlarmCorrelator, build_alarm_view, default_rules
+from .alarm.state import SEVERITY_WEIGHT
 from .audit.log import AuditLog
 from .audit.record import AuditRecord
 from .clock import Clock, SystemClock
@@ -89,6 +91,9 @@ class Platform:
         self.audit = AuditLog(
             self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512)
         )
+        # 总线保证全量订阅者（审计）先于主题订阅者收到事件：原始告警先落审计，
+        # 并组器的派生结论紧随其后，审计顺序与因果顺序一致。
+        self.alarms = AlarmCorrelator(self.bus, self.clock, self.config.alarm, default_rules())
         self.namespaces = NamespaceRegistry(unit)
         self.topology: Topology = build_default_topology()
         self.trend = TrendBuffer(period_s=self.config.quota.sample_period_s)
@@ -578,10 +583,19 @@ class Platform:
             return {**period, "lines": lines}
 
     def trip(self, reason: str = "overtemperature") -> dict:
-        """让热源停机。"""
+        """让热源停机。停机依据（首因组）随审计一起落盘，停堆只认首因那一组。"""
 
         with self._lock:
+            basis = self.alarms.shutdown_basis()
             state = self.source.trip(reason)
+            basis_payload = {}
+            if basis is not None:
+                basis_payload = {
+                    "basis_group": basis.group_id,
+                    "basis_root": basis.root or "",
+                    "basis_member_seq": basis.member_seq,
+                    "basis_digest": basis.members_digest,
+                }
             self.bus.publish(
                 Event.of(
                     "source",
@@ -592,9 +606,16 @@ class Platform:
                     reason=reason,
                     state=state,
                     temperature_c=round(self.source.temperature_c(), 2),
+                    **basis_payload,
                 )
             )
-            return {"ok": True, "state": state, "reason": reason, "trips": self.source.trips()}
+            return {
+                "ok": True,
+                "state": state,
+                "reason": reason,
+                "trips": self.source.trips(),
+                "basis": basis.as_dict() if basis is not None else None,
+            }
 
     def reset_source(self, operator: str = "shift-lead") -> dict:
         """复位热源停机。"""
@@ -613,6 +634,92 @@ class Platform:
                 )
             )
             return {"ok": True, "state": state, "operator": operator}
+
+    # ---- 告警并组 -----------------------------------------------------
+
+    def raise_alarm(
+        self,
+        alarm_id: str,
+        severity: str = "warning",
+        channel: str = "plant",
+        momentary: bool = False,
+        message: str = "",
+    ) -> dict:
+        """报出一条告警，由并组器按时间窗并组、标注首因。"""
+
+        if not alarm_id:
+            raise ValueError("alarm_id 不能为空")
+        if severity not in SEVERITY_WEIGHT:
+            raise ValueError(f"severity 必须是 {sorted(SEVERITY_WEIGHT)} 之一")
+        with self._lock:
+            self.bus.publish(
+                Event.of(
+                    "alarm",
+                    "alarm",
+                    "raise",
+                    alarm_id=alarm_id,
+                    state="active",
+                    severity=severity,
+                    channel=channel,
+                    momentary=bool(momentary),
+                    message=message or f"告警 {alarm_id} 报出",
+                )
+            )
+            return self._alarm_outcome(alarm_id)
+
+    def clear_alarm(self, alarm_id: str, channel: str = "plant") -> dict:
+        """解除一条告警；组解除由并组器在证据完整后判定。"""
+
+        if not alarm_id:
+            raise ValueError("alarm_id 不能为空")
+        with self._lock:
+            self.bus.publish(
+                Event.of(
+                    "alarm",
+                    "alarm",
+                    "clear",
+                    alarm_id=alarm_id,
+                    state="cleared",
+                    severity="notice",
+                    channel=channel,
+                    message=f"告警 {alarm_id} 解除",
+                )
+            )
+            return self._alarm_outcome(alarm_id)
+
+    def alarm_heartbeat(self, channel: str) -> dict:
+        """给某路告警通道打一次心跳；心跳缺失按部分失败处理。"""
+
+        if not channel:
+            raise ValueError("channel 不能为空")
+        with self._lock:
+            self.bus.publish(Event.of("heartbeat", channel, "beat", channel=channel))
+            return {"channel": channel, "health": self.alarms.health()}
+
+    def alarm_report(self) -> dict:
+        """并组全貌：健康、停堆依据、各组成员与首因，供控制台展示。"""
+
+        return build_alarm_view(self.alarms)
+
+    def _alarm_outcome(self, alarm_id: str) -> dict:
+        basis = self.alarms.shutdown_basis()
+        return {
+            "alarm_id": alarm_id,
+            "health": self.alarms.health(),
+            "basis": basis.as_dict() if basis is not None else None,
+        }
+
+    def _evaluate_alarm_trip(self) -> dict | None:
+        """按停堆依据自动停堆：只认首因那一组，首因挂起时不动作。"""
+
+        if not self.config.alarm.trip_on_alarm:
+            return None
+        basis = self.alarms.shutdown_basis()
+        if basis is None or not basis.actionable or basis.root_severity != "alarm":
+            return None
+        if self.source.state() == "tripped":
+            return None
+        return self.trip(f"alarm-group:{basis.group_id}:{basis.root}")
 
     # ---- 控制循环 -----------------------------------------------------
 
@@ -633,8 +740,10 @@ class Platform:
             self.trend.append("return_c", moment, self.secondary.return_c())
             self.trend.append("network_flow_t_h", moment, self.network.flow_t_h())
             self.trend.append("pressure_kpa", moment, self.secondary.pressure_kpa())
+            self.alarms.tick()
+            alarm_trip = self._evaluate_alarm_trip()
             self._persist()
-            return {"cycle": self._cycles, **report}
+            return {"cycle": self._cycles, **report, "alarm_trip": alarm_trip}
 
     def concurrency_probe(self, rounds: int = 24) -> dict:
         """用真实并行调用探测热源调整与热量采集的原子性。
@@ -813,6 +922,7 @@ class Platform:
             "zones": self.zones.describe(),
             "mapping": self.mapping.describe(),
             "quota": self.quota_report(),
+            "alarms": self.alarm_report(),
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
             "ids_issued": self.ids.issued(),

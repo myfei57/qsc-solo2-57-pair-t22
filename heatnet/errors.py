@@ -49,3 +49,7 @@ class NamespaceError(PlantError):
 
 class ForecastError(PlantError):
     """气象预报越界或曲线过期，禁止据此调质。"""
+
+
+class AlarmError(PlantError):
+    """告警摄入时序回退，或告警状态机约束被破坏。"""

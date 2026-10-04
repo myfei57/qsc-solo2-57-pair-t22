@@ -25,6 +25,7 @@ packages = [
     "heatnet.temp",
     "heatnet.pressure",
     "heatnet.quota",
+    "heatnet.alarm",
     "heatnet.sequence",
     "heatnet.console",
 ]

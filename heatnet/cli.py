@@ -95,6 +95,22 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     queued = platform.queue_commands(args.station, [55.0, 62.0], "demo-operator")
     replayed = platform.replay_valves([args.station])
     disturbance = platform.disturb_secondary(args.disturb)
+    # 告警并组演示：同一告警抖动重复报，再带出一组因果关联的爆发；并组器按时间窗
+    # 并成一组、标出首因，全部解除且证据完整后整组确认清除。
+    for _ in range(3):
+        platform.raise_alarm("source.overtemp", "warning", "source")
+    platform.raise_alarm("primary.low_flow", "warning", "primary")
+    platform.raise_alarm("secondary.overpressure", "warning", "secondary")
+    platform.cycle(dt=31.0)
+    alarm_burst = platform.alarm_report()
+    for alarm_id, channel in (
+        ("source.overtemp", "source"),
+        ("primary.low_flow", "primary"),
+        ("secondary.overpressure", "secondary"),
+    ):
+        platform.clear_alarm(alarm_id, channel)
+    platform.cycle(dt=1.0)
+    alarm_resolved = platform.alarm_report()
     concurrency = platform.concurrency_probe(rounds=args.rounds)
     trip = platform.trip("demo-complete")
     reset = platform.reset_source("demo-operator")
@@ -125,6 +141,13 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "queued": queued,
         "replayed": {key: replayed[key] for key in ("ok", "replayed", "applied")},
         "disturbance": disturbance,
+        "alarms": {
+            "burst_groups": len(alarm_burst["groups"]),
+            "burst_root": (alarm_burst["shutdown_basis"] or {}).get("root"),
+            "burst_members": sum(len(group["members"]) for group in alarm_burst["groups"]),
+            "resolved_health": alarm_resolved["health"]["status"],
+            "resolved_groups": [group["status"] for group in alarm_resolved["groups"]],
+        },
         "concurrency": concurrency,
         "trip": {key: trip[key] for key in ("ok", "state", "reason", "trips")},
         "reset": {key: reset[key] for key in ("ok", "state")},

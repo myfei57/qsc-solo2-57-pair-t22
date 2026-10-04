@@ -40,6 +40,15 @@ def _number(section: Mapping[str, Any], key: str, *, minimum: float | None = Non
     return number
 
 
+def _flag(section: Mapping[str, Any], key: str) -> bool:
+    value = section.get(key, _MISSING)
+    if value is _MISSING:
+        raise ConfigError(f"配置缺少字段 {key!r}", component="config")
+    if not isinstance(value, bool):
+        raise ConfigError(f"配置字段 {key!r} 必须是布尔值", component="config")
+    return value
+
+
 @dataclass(frozen=True)
 class SourceLimits:
     """热源供温带、流量边界与调质确认约束。"""
@@ -277,6 +286,38 @@ class QuotaLimits:
 
 
 @dataclass(frozen=True)
+class AlarmLimits:
+    """告警并组时间窗、首因判定与通道健康约束。
+
+    ``unclear_policy`` 是首因不明时的系统级处置：``report_worst`` 按最重的一条
+    报（标暂定，停堆不等人），``hold`` 挂起等首因明确（停堆依据不可执行）。
+    """
+
+    window_s: float
+    simultaneity_epsilon_s: float
+    heartbeat_timeout_s: float
+    unclear_policy: str
+    clearance_requires_full_health: bool
+    trip_on_alarm: bool
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "AlarmLimits":
+        policy = section.get("unclear_policy", _MISSING)
+        if policy is _MISSING:
+            raise ConfigError("配置缺少字段 'unclear_policy'", component="config")
+        if policy not in ("report_worst", "hold"):
+            raise ConfigError("unclear_policy 必须是 'report_worst' 或 'hold'", component="config")
+        return cls(
+            window_s=_number(section, "window_s", minimum=0.1),
+            simultaneity_epsilon_s=_number(section, "simultaneity_epsilon_s", minimum=0.0),
+            heartbeat_timeout_s=_number(section, "heartbeat_timeout_s", minimum=0.1),
+            unclear_policy=str(policy),
+            clearance_requires_full_health=_flag(section, "clearance_requires_full_health"),
+            trip_on_alarm=_flag(section, "trip_on_alarm"),
+        )
+
+
+@dataclass(frozen=True)
 class PlatformConfig:
     """一份完整的平台配置。"""
 
@@ -291,6 +332,7 @@ class PlatformConfig:
     pump: PumpLimits
     pressure: PressureLimits
     quota: QuotaLimits
+    alarm: AlarmLimits
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> "PlatformConfig":
@@ -315,6 +357,7 @@ class PlatformConfig:
             pump=PumpLimits.from_mapping(_section(limits, "pump")),
             pressure=PressureLimits.from_mapping(_section(limits, "pressure")),
             quota=QuotaLimits.from_mapping(_section(limits, "quota")),
+            alarm=AlarmLimits.from_mapping(_section(limits, "alarm")),
         )
 
 
@@ -345,6 +388,7 @@ def default_config() -> PlatformConfig:
         pump=PumpLimits(40.0, 20.0, 100.0),
         pressure=PressureLimits(240.0, 430.0, 6.0),
         quota=QuotaLimits(100000.0, 30.0, 24.0),
+        alarm=AlarmLimits(30.0, 1.0, 60.0, "report_worst", True, True),
     )
 
 
@@ -406,6 +450,14 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "meter_wrap_mwh": cfg.quota.meter_wrap_mwh,
                 "sample_period_s": cfg.quota.sample_period_s,
                 "period_hours": cfg.quota.period_hours,
+            },
+            "alarm": {
+                "window_s": cfg.alarm.window_s,
+                "simultaneity_epsilon_s": cfg.alarm.simultaneity_epsilon_s,
+                "heartbeat_timeout_s": cfg.alarm.heartbeat_timeout_s,
+                "unclear_policy": cfg.alarm.unclear_policy,
+                "clearance_requires_full_health": cfg.alarm.clearance_requires_full_health,
+                "trip_on_alarm": cfg.alarm.trip_on_alarm,
             },
         },
     }
