@@ -56,6 +56,14 @@
       "meter_wrap_mwh": 100000.0,
       "sample_period_s": 30.0,
       "period_hours": 24.0
+    },
+    "alarm": {
+      "causal_window_s": 8.0,
+      "group_close_s": 15.0,
+      "root_hold_s": 10.0,
+      "missing_after_s": 12.0,
+      "order_lag_s": 0.0,
+      "unknown_root_policy": "hold-then-heaviest"
     }
   }
 }

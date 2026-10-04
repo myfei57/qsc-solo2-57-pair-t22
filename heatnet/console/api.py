@@ -54,6 +54,12 @@ class Api:
         add("GET", "/api/events", self._events)
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/alarms", self._alarms)
+        add("GET", "/api/alarm/groups", self._alarm_groups)
+        add("GET", "/api/alarm/group/{group_id}", self._alarm_group)
+        add("POST", "/api/alarm/raise", self._alarm_raise)
+        add("POST", "/api/alarm/clear", self._alarm_clear)
+        add("POST", "/api/alarm/tick", self._alarm_tick)
+        add("POST", "/api/alarm/ack", self._alarm_ack)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
         add("GET", "/api/store", self._store)
@@ -203,6 +209,46 @@ class Api:
         return {
             "recent": self._platform.audit.alarms()[-limit:],
             "latch": self._platform.source.snapshot().as_dict(),
+            "groups": self._platform.alarm_groups(active_only=True),
+            "summary": self._platform.alarms.summary(),
+            "tripped_group": self._platform.alarms.tripped_group(),
+        }
+
+    def _alarm_groups(self, params: dict, body: dict) -> dict:
+        active_only = str(params.get("active", "true")).lower() not in ("0", "false", "no")
+        return {
+            "policy": "causal-chain",
+            "summary": self._platform.alarms.summary(),
+            "groups": self._platform.alarm_groups(active_only=active_only),
+        }
+
+    def _alarm_group(self, params: dict, body: dict) -> dict:
+        return {"group": self._platform.alarm_group(str(params.get("group_id", "")))}
+
+    def _alarm_raise(self, params: dict, body: dict) -> dict:
+        return self._platform.raise_alarm(
+            str(body.get("channel", "")),
+            str(body.get("code", "")),
+            scope=str(body.get("scope", "")),
+            message=str(body.get("message", "")),
+        )
+
+    def _alarm_clear(self, params: dict, body: dict) -> dict:
+        return self._platform.clear_alarm(
+            str(body.get("channel", "")),
+            str(body.get("code", "")),
+            scope=str(body.get("scope", "")),
+            message=str(body.get("message", "")),
+        )
+
+    def _alarm_tick(self, params: dict, body: dict) -> dict:
+        return self._platform.alarm_tick()
+
+    def _alarm_ack(self, params: dict, body: dict) -> dict:
+        return {
+            "group": self._platform.acknowledge_alarm_group(
+                str(body.get("group_id", "")), str(body.get("operator", "shift-lead"))
+            )
         }
 
     def _timeline(self, params: dict, body: dict) -> dict:

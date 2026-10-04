@@ -29,6 +29,7 @@ DEFAULT_PROBE_PATHS = (
     "/api/readiness",
     "/api/topology",
     "/api/audit",
+    "/api/alarm/groups",
     "/api/stations",
     "/api/quota",
 )

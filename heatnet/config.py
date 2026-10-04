@@ -276,6 +276,39 @@ class QuotaLimits:
         )
 
 
+# 并组策略必须定死，不允许现场临时切换：只按因果链并组，时间窗只用于闭窗与
+# 缺采判定，不单独成组。首因不明时先挂起等待，挂起到点仍不明确再按最重一条升级。
+ALARM_POLICY = "causal-chain"
+ROOT_UNKNOWN_POLICIES = ("hold-then-heaviest", "heaviest-immediate")
+
+
+@dataclass(frozen=True)
+class AlarmLimits:
+    """告警并组的时间窗、首因挂起与缺采判定约束。"""
+
+    causal_window_s: float
+    group_close_s: float
+    root_hold_s: float
+    missing_after_s: float
+    order_lag_s: float
+    unknown_root_policy: str
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "AlarmLimits":
+        policy = str(section.get("unknown_root_policy", "hold-then-heaviest"))
+        if policy not in ROOT_UNKNOWN_POLICIES:
+            raise ConfigError(
+                f"首因不明策略必须是 {ROOT_UNKNOWN_POLICIES} 之一", component="config"
+            )
+        return cls(
+            causal_window_s=_number(section, "causal_window_s", minimum=0.1),
+            group_close_s=_number(section, "group_close_s", minimum=0.1),
+            root_hold_s=_number(section, "root_hold_s", minimum=0.1),
+            missing_after_s=_number(section, "missing_after_s", minimum=0.1),
+            order_lag_s=_number(section, "order_lag_s", minimum=0.0),
+            unknown_root_policy=policy,
+        )
+
 @dataclass(frozen=True)
 class PlatformConfig:
     """一份完整的平台配置。"""
@@ -291,6 +324,7 @@ class PlatformConfig:
     pump: PumpLimits
     pressure: PressureLimits
     quota: QuotaLimits
+    alarm: AlarmLimits
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> "PlatformConfig":
@@ -303,6 +337,9 @@ class PlatformConfig:
             raise ConfigError("platform.storage_root 必须是非空字符串", component="config")
 
         limits = _section(mapping, "limits")
+        alarm_section = limits.get("alarm")
+        if not isinstance(alarm_section, Mapping):
+            alarm_section = _DEFAULT_ALARM_MAPPING
         return cls(
             name=name,
             storage_root=storage_root,
@@ -315,6 +352,7 @@ class PlatformConfig:
             pump=PumpLimits.from_mapping(_section(limits, "pump")),
             pressure=PressureLimits.from_mapping(_section(limits, "pressure")),
             quota=QuotaLimits.from_mapping(_section(limits, "quota")),
+            alarm=AlarmLimits.from_mapping(alarm_section),
         )
 
 
@@ -345,7 +383,19 @@ def default_config() -> PlatformConfig:
         pump=PumpLimits(40.0, 20.0, 100.0),
         pressure=PressureLimits(240.0, 430.0, 6.0),
         quota=QuotaLimits(100000.0, 30.0, 24.0),
+        alarm=AlarmLimits(8.0, 15.0, 10.0, 12.0, 0.0, "hold-then-heaviest"),
     )
+
+
+# 旧配置文件没有 alarm 段时使用的内置缺省，保证带着定死的策略启动而不是报错。
+_DEFAULT_ALARM_MAPPING: Mapping[str, Any] = {
+    "causal_window_s": 8.0,
+    "group_close_s": 15.0,
+    "root_hold_s": 10.0,
+    "missing_after_s": 12.0,
+    "order_lag_s": 0.0,
+    "unknown_root_policy": "hold-then-heaviest",
+}
 
 
 def config_to_mapping(cfg: PlatformConfig) -> dict:
@@ -406,6 +456,15 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "meter_wrap_mwh": cfg.quota.meter_wrap_mwh,
                 "sample_period_s": cfg.quota.sample_period_s,
                 "period_hours": cfg.quota.period_hours,
+            },
+            "alarm": {
+                "policy": ALARM_POLICY,
+                "causal_window_s": cfg.alarm.causal_window_s,
+                "group_close_s": cfg.alarm.group_close_s,
+                "root_hold_s": cfg.alarm.root_hold_s,
+                "missing_after_s": cfg.alarm.missing_after_s,
+                "order_lag_s": cfg.alarm.order_lag_s,
+                "unknown_root_policy": cfg.alarm.unknown_root_policy,
             },
         },
     }

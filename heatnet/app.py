@@ -13,6 +13,7 @@ import threading
 
 from .audit.log import AuditLog
 from .audit.record import AuditRecord
+from .alarm.correlator import AlarmCorrelator
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config
 from .errors import PlantError
@@ -89,6 +90,8 @@ class Platform:
         self.audit = AuditLog(
             self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512)
         )
+        self.alarms = AlarmCorrelator(self.config.alarm, clock=self.clock, bus=self.bus)
+        self.alarms.set_save_hook(self._save_alarm_state)
         self.namespaces = NamespaceRegistry(unit)
         self.topology: Topology = build_default_topology()
         self.trend = TrendBuffer(period_s=self.config.quota.sample_period_s)
@@ -197,9 +200,10 @@ class Platform:
             records = self.audit.to_records(self.audit.replay_from_journal(limit=100_000))
         except PlantError:
             return
-        trips = [item for item in records if item.action == "trip"]
+        self.alarms.restore(self.durable.load("alarm_groups"))
+        trips = [item for item in records if item.action in ("trip", "auto_trip")]
         if trips:
-            reason = str(trips[-1].payload.get("reason", "unknown"))
+            reason = str(trips[-1].payload.get("reason") or trips[-1].payload.get("root_code") or "unknown")
             self.source.trip(reason)
 
     def _persist(self) -> None:
@@ -209,6 +213,40 @@ class Platform:
             "platform_state",
             {"operations": self._operations, "cycles": self._cycles, "unit": self.unit},
         )
+
+    def _save_alarm_state(self, snapshot: dict) -> None:
+        """把并组当前态落盘（由并组器在每次状态迁移时回调）。"""
+
+        self.durable.save("alarm_groups", snapshot)
+
+    def _auto_trip_from_alarms(self) -> list[dict]:
+        """按并组器给出的首因组执行联锁停机；停堆只认首因那一组。"""
+
+        tripped: list[dict] = []
+        for basis in self.alarms.due_trips():
+            group_id = basis["group_id"]
+            if self.source.state() == "tripped":
+                self.alarms.mark_trip_skipped(group_id)
+                continue
+            reason = f"{basis['root_code']}@{group_id}"
+            state = self.source.trip(reason)
+            self.bus.publish(
+                Event.of(
+                    "alarm",
+                    "alarm",
+                    "auto_trip",
+                    severity="alarm",
+                    message=f"首因组 {group_id} 首因 {basis['root_code']} 触发联锁停机",
+                    group_id=group_id,
+                    root_code=basis["root_code"],
+                    root_seq=basis["root_seq"],
+                    root_status=basis["root_status"],
+                    policy="causal-chain",
+                    state=state,
+                )
+            )
+            tripped.append(basis)
+        return tripped
 
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写审计，并记一条汇总事件。"""
@@ -245,6 +283,15 @@ class Platform:
                     violation=violation,
                 )
             )
+            self.alarms.report(
+                "plant.heat_source",
+                "src.interlock_reject",
+                scope=asset,
+                message=f"{operation} 被拒绝：{violation}",
+                severity="alarm",
+            )
+        self.alarms.tick()
+        self._auto_trip_from_alarms()
         summary = {
             "op_id": op_id,
             "operation": operation,
@@ -578,7 +625,11 @@ class Platform:
             return {**period, "lines": lines}
 
     def trip(self, reason: str = "overtemperature") -> dict:
-        """让热源停机。"""
+        """让热源停机。
+
+        停机动作同时作为一路 ``src.overtemp`` 告警进并组器：值班员手动停机与自动
+        联锁停机走同一条因果链标注，停机依据（首因组、首因码）随之落审计。
+        """
 
         with self._lock:
             state = self.source.trip(reason)
@@ -594,7 +645,24 @@ class Platform:
                     temperature_c=round(self.source.temperature_c(), 2),
                 )
             )
-            return {"ok": True, "state": state, "reason": reason, "trips": self.source.trips()}
+            self.alarms.report(
+                "plant.heat_source",
+                "src.overtemp",
+                message=f"热源停机：{reason}",
+                severity="alarm",
+            )
+            self.alarms.tick()
+            # 手动停机先于自动停机：首因组可能还在挂起窗内，直接标记，避免重复停机。
+            for basis in self.alarms.due_trips():
+                self.alarms.mark_trip_skipped(basis["group_id"])
+            tripped = self.alarms.tripped_group()
+            return {
+                "ok": True,
+                "state": state,
+                "reason": reason,
+                "trips": self.source.trips(),
+                "group_id": tripped["group_id"] if tripped else None,
+            }
 
     def reset_source(self, operator: str = "shift-lead") -> dict:
         """复位热源停机。"""
@@ -612,7 +680,102 @@ class Platform:
                     operator=operator,
                 )
             )
+            self.alarms.tick()
             return {"ok": True, "state": state, "operator": operator}
+
+    # ---- 告警并组 -----------------------------------------------------
+
+    # 平台既有告警来源到统一因果编码的归一化表；所有报警都走这一个入口，
+    # 并组、停机依据与审计口径才不会分叉。
+    _ALARM_CODE_BY_ACTION = {
+        "trip": "src.overtemp",
+        "interlock_rejected": "src.interlock_reject",
+    }
+
+    def raise_alarm(
+        self,
+        channel: str,
+        code: str,
+        *,
+        scope: str = "",
+        message: str = "",
+        ts: float | None = None,
+        severity: str | None = None,
+    ) -> dict:
+        """上报一路告警发生，交给并组器按因果链并组并标注首因。"""
+
+        with self._lock:
+            result = self.alarms.report(
+                channel,
+                code,
+                scope=scope,
+                message=message,
+                ts=ts,
+                severity=severity,
+                cleared=False,
+            )
+            self.alarms.tick()
+            trips = self._auto_trip_from_alarms()
+            return {"ok": True, **result, "auto_trips": trips}
+
+    def clear_alarm(
+        self,
+        channel: str,
+        code: str,
+        *,
+        scope: str = "",
+        message: str = "",
+        ts: float | None = None,
+    ) -> dict:
+        """上报一路告警恢复（现场该通道回到正常）。"""
+
+        with self._lock:
+            result = self.alarms.report(
+                channel,
+                code,
+                scope=scope,
+                message=message,
+                ts=ts,
+                cleared=True,
+            )
+            self.alarms.tick()
+            return {"ok": True, **result}
+
+    def alarm_tick(self) -> dict:
+        """推进并组时序（闭窗、缺采、挂起到点推定、整组解除与自动停机）。"""
+
+        with self._lock:
+            moved = self.alarms.tick()
+            moved["auto_trips"] = self._auto_trip_from_alarms()
+            return moved
+
+    def alarm_groups(self, active_only: bool = False) -> list[dict]:
+        """返回告警组（供控制台展示）。"""
+
+        with self._lock:
+            return self.alarms.groups(active_only=active_only)
+
+    def alarm_group(self, group_id: str) -> dict:
+        """返回单个告警组明细。"""
+
+        with self._lock:
+            return self.alarms.get(group_id)
+
+    def acknowledge_alarm_group(self, group_id: str, operator: str = "shift-lead") -> dict:
+        """值班员确认被缺采阻塞的告警组。"""
+
+        with self._lock:
+            return self.alarms.acknowledge(group_id, operator)
+
+    def alarm_report(self) -> dict:
+        """告警并组汇总：策略、计数、在役组与导致当前停机的首因组。"""
+
+        with self._lock:
+            return {
+                "summary": self.alarms.summary(),
+                "active": self.alarms.active_groups(),
+                "tripped_group": self.alarms.tripped_group(),
+            }
 
     # ---- 控制循环 -----------------------------------------------------
 
@@ -633,8 +796,39 @@ class Platform:
             self.trend.append("return_c", moment, self.secondary.return_c())
             self.trend.append("network_flow_t_h", moment, self.network.flow_t_h())
             self.trend.append("pressure_kpa", moment, self.secondary.pressure_kpa())
+            self._detect_process_alarms(moment)
+            self.alarms.tick(moment)
+            self._auto_trip_from_alarms()
             self._persist()
             return {"cycle": self._cycles, **report}
+
+    def _detect_process_alarms(self, moment: float) -> None:
+        """控制周期内的过程越限检测：同一通道抖动续记，不重复开组。"""
+
+        if self.config.source.overtemperature(self.source.temperature_c()):
+            self.alarms.report(
+                "plant.heat_source",
+                "src.overtemp",
+                ts=moment,
+                message=f"供水温度 {round(self.source.temperature_c(), 2)}℃ 越上限",
+                severity="alarm",
+            )
+        if self.network.low_flow():
+            self.alarms.report(
+                "primary.flow_meter",
+                "primary.low_flow",
+                ts=moment,
+                message="一次网流量跌破联锁门限",
+                severity="alarm",
+            )
+        if self.secondary.needs_makeup():
+            self.alarms.report(
+                "secondary.pressure_sensor",
+                "secondary.low_pressure",
+                ts=moment,
+                message="二次网定压跌破补水门限",
+                severity="alarm",
+            )
 
     def concurrency_probe(self, rounds: int = 24) -> dict:
         """用真实并行调用探测热源调整与热量采集的原子性。
@@ -815,6 +1009,7 @@ class Platform:
             "quota": self.quota_report(),
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
+            "alarms": self.alarm_report(),
             "ids_issued": self.ids.issued(),
         }
 
@@ -829,6 +1024,7 @@ class Platform:
             "mapping": self.mapping.describe(),
             "trend": self.trend.snapshot(),
             "alarms_recent": self.audit.alarms()[-10:],
+            "alarm_groups": self.alarm_groups(),
             "billing": self.billing(self.config.quota.meter_wrap_mwh / 40.0),
         }
 
